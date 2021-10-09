@@ -1,0 +1,1002 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(openxlsx)
+library(dplyr)
+library(forecast)
+library(rugarch)
+library(Rsolnp)
+library(e1071)
+library(quantmod)
+library(tibble)
+library(scatterplot3d)
+library(VineCopula)
+library(PMCMRplus)
+library(Quandl)
+
+stock_names <- read.csv("компания-сектор.csv",sep=",")     # Data with companies tickers and sector
+stock_names$symbol <- as.character(stock_names$symbol)
+stock_names <- stock_names[,-1]
+
+tau=10
+param=1
+
+```
+
+
+
+    # Downloading historical stock prices for uploaded tickers 
+```{r}
+stock_prices <- data_frame()
+for (i in 1:nrow(stock_names)){
+  a <- tryCatch(getSymbols(stock_names[i,1], src = 'yahoo', from = '2019-03-01',to="2021-03-01", auto.assign = F),error=function(e){print(paste("failed to download",stock_names[i,1]))})
+  if (grepl("failed",a)==FALSE){
+    a <- a[,c(1,5)]
+    colnames(a) <- c(paste0(stock_names[i,1],"_open"),paste0(stock_names[i,1],"_volume"))
+    for (j in 1:nrow(a)){
+      a[j,1] <- ifelse(is.na(a[j,1])==TRUE,a[j-1,1],a[j,1])
+      a[j,2] <- ifelse(is.na(a[j,2])==TRUE,a[j-1,2],a[j,2])
+    }
+  if (mean(a[,2])>500){                          # if average historical volume is less than 500, stock is not accepted for further calculations
+      stock_prices <- cbind(stock_prices,a)
+      print("success")
+      print(dim(stock_prices))
+  }
+  }
+}
+stock_prices <- data.frame(stock_prices)
+
+n=round(nrow(stock_prices)/tau,0)
+```
+
+
+# Some useful functions 
+```{r}
+############################ function to calculate returns for vector with prices
+log_function <- function(x){
+  x_log <- c()
+  for (i in 2:length(x)){
+    x_log <- c(x_log,log(x[i]/x[i-1]))
+  }
+  return (x_log)
+}
+############################
+
+########################### this function counts cumulative probabilities for a sorted vector
+count_less <- function(v){
+  r <- c()
+  for (i in 1:length(v)){
+    k=0
+    for (j in 1:length(v)){
+      if (v[j]<v[i]){
+        k=k+1
+      }
+    }
+  r <- c(r,k/length(v))
+  }
+  return (r)
+}
+##########################
+
+############################# this function assigns cumulative probabilities to all values of the original returns vector of the price
+empir_function <- function(x){
+  x1=sort(x)
+  prob <- count_less(x1)
+  prob <- c(prob,1)
+  x1 <- c(x1,max(x1)+0.1)
+  y <- c(1:length(x))
+  for (i in 1:(length(x))){
+    k=which(x1[i]==x)
+    if (length(k)>1){
+      for (j in 1:length(k)){
+        y[k[j]]=prob[i]
+      }
+    }
+    y[k] <- prob[i]
+  }
+  return (y)
+}
+##############################
+
+############################## this function return cumulative probabilities of stocks prices 
+uniform_data <- function(data){
+  m <- c(1:nrow(data)-1)
+  for ( i in 1:ncol(data)){
+    k=empir_function(data[,i])
+    m=cbind(m,k)
+  }
+  m <- m[,(2:ncol(m))]
+  colnames(m) <- colnames(data)
+  return (m)
+}
+
+```
+
+
+Function that applies Andersen-Darling test for stocks prices in order to find the best point in time in the past
+```{r}
+andersen_darling_stocks_test <- function(data){
+  tau=10
+  param=1
+  n=round(nrow(data)/tau,0)
+  for (j in 1:ncol(data)){
+     matr <- matrix(ncol=5,nrow=n)
+     price <- as.vector(data[,j])
+     for (i in 4:(n-4)){
+           k <- i*tau
+           p <- length(price)
+           y <- price[0:k]
+           z <- price[(k+1):p]
+           g <- factor(x=c(rep(1,k),rep(2,(p-k))),labels=c("fisrt_time","second_time"))
+           dat1 <- data.frame(g=g,x=c(y,z))
+           test <- adKSampleTest(x~g,data=dat1)
+           c=c(colnames(data)[j],i*tau,as.vector(test$estimate)[1],as.vector(as.numeric(test$estimate))[2],as.vector(as.numeric(test$p.value))[1])
+           matr[i,] <- c}
+     matr <- matr[-c(1:3),]
+     matr <- matr[-c((nrow(matr)-3):nrow(matr)),]
+     matr <- data.frame(matr)
+     colnames(matr) <- c("Stock","Itau","Akm2","sigma","p_value")
+     matr$Akm2 <- as.numeric(as.character(matr$Akm2))
+     k_ad=max(matr$Akm2)
+     print(k_ad)
+     k <- filter(matr,Akm2==k_ad)
+     if (param==1){
+       pec <- k
+       param=param+1
+     }
+     else{
+       pec <- rbind(pec,k)
+     }
+     
+     }
+     rm(matr)
+  return (pec)
+}
+```
+
+
+```{r}
+# this fuction collect model name
+collect_colnames <- function(vector,model.name){
+  vector <- c(vector,model.name)
+  return (vector)
+}
+
+# this function add the best model name tothe list 
+append_to_fit <- function(list,model){
+  list <- c(list,model)
+  return (list)
+  }
+
+### здесь нужно написать включение модели вконечный список моделей
+test_garch_model <- function(specasic,name,dates){
+     garch <- tryCatch(ugarchfit(spec = specasic,data=dates,solver = "nloptr",solver.control = list("solver" = 8)),
+     warning = function(w) {print(paste("negative argument", input))},
+     error=function(e){print(paste("can not evaluate",name))})
+     
+     return(garch)
+}
+
+# evaluation of all sorts of different specifications of a simple GARCH model
+best_fitted_garch <- function(x,arma_par){
+  model.list <-  c()
+  model.names <- c()
+
+  garchspec01 <- ugarchspec(variance.model = list(garchOrder=c(1,0)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  garchspec02 <- ugarchspec(variance.model = list(garchOrder=c(2,0)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  garchspec03 <- ugarchspec(variance.model = list(garchOrder=c(0,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  garchspec04 <- ugarchspec(variance.model = list(garchOrder=c(0,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  garchspec05 <- ugarchspec(variance.model = list(garchOrder=c(1,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  garchspec06 <- ugarchspec(variance.model = list(garchOrder=c(2,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  garchspec07 <- ugarchspec(variance.model = list(garchOrder=c(1,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  garchspec08 <- ugarchspec(variance.model = list(garchOrder=c(2,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  
+  garch01 <- test_garch_model(garchspec01,"garch01",x)
+  if(class(garch01)!="character"){
+    model.list=append_to_fit(model.list,garch01)
+    model.names <- collect_colnames(model.names,"garch01")
+  }
+  garch02 <- test_garch_model(garchspec02,"garch02",x)
+  if(class(garch02)!="character"){
+    model.list=append_to_fit(model.list,garch02)
+    model.names <- collect_colnames(model.names,"garch02")
+  }
+  garch03 <- test_garch_model(garchspec03,"garch03",x)
+  if(class(garch03)!="character"){
+    model.list=append_to_fit(model.list,garch03)
+    model.names <- collect_colnames(model.names,"garch03")
+  }
+  garch04 <- test_garch_model(garchspec04,"garch04",x)
+  if(class(garch04)!="character"){
+    model.list=append_to_fit(model.list,garch04)
+    model.names <- collect_colnames(model.names,"garch04")
+  }
+  garch05 <- test_garch_model(garchspec05,"garch05",x)
+  if(class(garch05)!="character"){
+    model.list=append_to_fit(model.list,garch05)
+    model.names <- collect_colnames(model.names,"garch05")
+  }
+  garch06 <- test_garch_model(garchspec06,"garch06",x)
+  if(class(garch06)!="character"){
+    model.list=append_to_fit(model.list,garch06)
+    model.names <- collect_colnames(model.names,"garch06")
+  }
+  garch07 <- test_garch_model(garchspec07,"garch07",x)
+  if(class(garch07)!="character"){
+    model.list=append_to_fit(model.list,garch07)
+    model.names <- collect_colnames(model.names,"garch07")
+  }
+  garch08 <- test_garch_model(garchspec08,"garch08",x)
+  if(class(garch08)!="character"){
+    model.list=append_to_fit(model.list,garch08)
+    model.names <- collect_colnames(model.names,"garch08")
+  }
+  
+  egarchspec01 <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,0)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  egarchspec02 <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(2,0)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  egarchspec03 <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(0,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  egarchspec04 <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(0,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  egarchspec05 <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  egarchspec06 <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(2,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  egarchspec07 <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  egarchspec08 <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(2,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  egarch01 <- test_garch_model(egarchspec01,"egarch01",x)
+  if(class(egarch01)!="character"){
+    model.list=append_to_fit(model.list,egarch01)
+    model.names <- collect_colnames(model.names,"egarch01")
+  }
+  egarch02 <- test_garch_model(egarchspec02,"egarch02",x)
+  if(class(egarch02)!="character"){
+    model.list=append_to_fit(model.list,egarch02)
+    model.names <- collect_colnames(model.names,"egarch02")
+  }
+  egarch03 <- test_garch_model(egarchspec03,"egarch03",x)
+  if(class(egarch03)!="character"){
+    model.list=append_to_fit(model.list,egarch03)
+    model.names <- collect_colnames(model.names,"egarch03")
+  }
+  egarch04 <- test_garch_model(egarchspec04,"egarch04",x)
+  if(class(egarch04)!="character"){
+    model.list=append_to_fit(model.list,egarch04)
+    model.names <- collect_colnames(model.names,"egarch04")
+  }
+  egarch05 <- test_garch_model(egarchspec05,"egarch05",x)
+  if(class(egarch05)!="character"){
+    model.list=append_to_fit(model.list,egarch05)
+    model.names <- collect_colnames(model.names,"egarch05")
+  }
+  egarch06 <- test_garch_model(egarchspec06,"egarch06",x)
+  if(class(egarch06)!="character"){
+    model.list=append_to_fit(model.list,egarch06)
+    model.names <- collect_colnames(model.names,"egarch06")
+  }
+  egarch07 <- test_garch_model(egarchspec07,"egarch07",x)
+  if(class(egarch07)!="character"){
+    model.list=append_to_fit(model.list,egarch07)
+    model.names <- collect_colnames(model.names,"egarch07")
+  }
+  egarch08 <- test_garch_model(egarchspec08,"egarch08",x)
+  if(class(egarch08)!="character"){
+    model.list=append_to_fit(model.list,egarch08)
+    model.names <- collect_colnames(model.names,"egarch08")
+  }
+  
+  
+  grjgarchspec01 <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(1,0)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  grjgarchspec02 <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(2,0)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  grjgarchspec03 <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(0,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  grjgarchspec04 <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(0,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  grjgarchspec05 <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  grjgarchspec06 <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(2,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  grjgarchspec07 <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(1,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  grjgarchspec08 <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(2,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  
+  grjgarch01 <- test_garch_model(grjgarchspec01,"grjgarch01",x)
+  if(class(grjgarch01)!="character"){
+    model.list=append_to_fit(model.list,grjgarch01)
+    model.names <- collect_colnames(model.names,"grjgarch01")
+  }
+  grjgarch02 <- test_garch_model(grjgarchspec02,"grjgarch02",x)
+  if(class(grjgarch02)!="character"){
+    model.list=append_to_fit(model.list,grjgarch02)
+    model.names <- collect_colnames(model.names,"grjgarch02")
+  }
+  grjgarch03 <- test_garch_model(grjgarchspec03,"grjgarch03",x)
+  if(class(grjgarch03)!="character"){
+    model.list=append_to_fit(model.list,grjgarch03)
+    model.names <- collect_colnames(model.names,"grjgarch03")
+  }
+  grjgarch04 <- test_garch_model(grjgarchspec04,"grjgarch04",x)
+  if(class(grjgarch04)!="character"){
+    model.list=append_to_fit(model.list,grjgarch04)
+    model.names <- collect_colnames(model.names,"grjgarch04")
+  }
+  grjgarch05 <- test_garch_model(grjgarchspec05,"grjgarch05",x)
+  if(class(grjgarch05)!="character"){
+    model.list=append_to_fit(model.list,grjgarch05)
+    model.names <- collect_colnames(model.names,"grjgarch05")
+  }
+  grjgarch06 <- test_garch_model(grjgarchspec06,"grjgarch06",x)
+  if(class(grjgarch06)!="character"){
+    model.list=append_to_fit(model.list,grjgarch06)
+    model.names <- collect_colnames(model.names,"grjgarch06")
+  }
+  grjgarch07 <- test_garch_model(grjgarchspec07,"grjgarch07",x)
+  if(class(grjgarch07)!="character"){
+    model.list=append_to_fit(model.list,grjgarch07)
+    model.names <- collect_colnames(model.names,"grjgarch07")
+  }
+  grjgarch08 <- test_garch_model(grjgarchspec08,"grjgarch08",x)
+  if(class(grjgarch08)!="character"){
+    model.list=append_to_fit(model.list,grjgarch08)
+    model.names <- collect_colnames(model.names,"grjgarch08")
+  }
+  
+  
+  agarchspec01 <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(1,0)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  agarchspec02 <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(2,0)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  agarchspec03 <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(0,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  agarchspec04 <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(0,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  agarchspec05 <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  agarchspec06 <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(2,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  agarchspec07 <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(1,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  agarchspec08 <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(2,2)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  agarch01 <- test_garch_model(agarchspec01,"agarch01",x)
+  if(class(agarch01)!="character"){
+    model.list=append_to_fit(model.list,agarch01)
+    model.names <- collect_colnames(model.names,"agarch01")
+  }
+  agarch02 <- test_garch_model(agarchspec02,"agarch02",x)
+  if(class(agarch02)!="character"){
+    model.list=append_to_fit(model.list,agarch02)
+    model.names <- collect_colnames(model.names,"agarch02")
+  }
+  agarch03 <- test_garch_model(agarchspec03,"agarch03",x)
+  if(class(agarch03)!="character"){
+    model.list=append_to_fit(model.list,agarch03)
+    model.names <- collect_colnames(model.names,"agarch03")
+  }
+  agarch04 <- test_garch_model(agarchspec04,"agarch04",x)
+  if(class(agarch04)!="character"){
+    model.list=append_to_fit(model.list,agarch04)
+    model.names <- collect_colnames(model.names,"agarch04")
+  }
+  agarch05 <- test_garch_model(agarchspec05,"agarch05",x)
+  if(class(agarch05)!="character"){
+    model.list=append_to_fit(model.list,agarch05)
+    model.names <- collect_colnames(model.names,"agarch05")
+  }
+  agarch06 <- test_garch_model(agarchspec06,"agarch06",x)
+  if(class(agarch06)!="character"){
+    model.list=append_to_fit(model.list,agarch06)
+    model.names <- collect_colnames(model.names,"agarch06")
+  }
+  agarch07 <- test_garch_model(agarchspec07,"agarch07",x)
+  if(class(agarch07)!="character"){
+    model.list=append_to_fit(model.list,agarch07)
+    model.names <- collect_colnames(model.names,"agarch07")
+  }
+  agarch08 <- test_garch_model(agarchspec08,"agarch08",x)
+  if(class(agarch08)!="character"){
+    model.list=append_to_fit(model.list,agarch08)
+    model.names <- collect_colnames(model.names,"agarch08")
+  }
+  
+  info.mat=c(1,1,1,1)
+  right_colnames <- c()
+  for (i in 1:length(model.list)){
+    c <- tryCatch(sapply(model.list[i],infocriteria),
+     warning = function(w) {print(paste("negative argument", input))},
+     error=function(e){print(paste("can not estimate parametrs for ",model.names[i]))})
+    if(class(c)!="character"){
+      info.mat <- cbind(info.mat,c)
+      right_colnames <- c(right_colnames,model.names[i])
+    }
+  }
+  info.mat <- info.mat[,-1]
+  rownames(info.mat) = c("Akaike","Bayes","Shibata","Hannan_Quinn")
+  colnames(info.mat) =right_colnames
+  info.mat <- data.frame(info.mat)
+  info.mat=t(info.mat)
+  return(info.mat)
+}
+```
+
+
+If for some reason it is impossible to calculate the residuals for the best model, then a backup option is used in the form of EGARCH(1,1)
+```{r}
+
+trap_for_garch_resid <- function(fiti,model_name,log_return){
+  garch <- test_garch_model(fiti,model_name,log_return)
+  arima_parametrs <- arimaorder(auto.arima(log_return))
+  arma_par <- c(arima_parametrs[1],arima_parametrs[3])
+  spec <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  if (class(garch)=="character"){
+    garch <- test_garch_model(spec,model_name,log_return)
+    if(class(garch)!="character"){
+        print("EGARCH as a backup version was used")
+        return(residuals(garch))}
+    else {
+      spec <- ugarchspec(variance.model = list(garchOrder=c(1,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+      garch <- test_garch_model(spec,model_name,log_return)
+      print("EGARCH as a backup version was used")
+      return(residuals(garch))
+    }
+  }
+  else{
+    return(residuals(garch))
+  }
+}
+
+trap_for_garch_forecasts <- function(fiti,model_name,log_return,forecast_horizon){
+  garch <- test_garch_model(fiti,model_name,log_return)
+  arima_parametrs <- arimaorder(auto.arima(log_return))
+  arma_par <- c(arima_parametrs[1],arima_parametrs[3])
+  spec <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+  if (class(garch)=="character"){
+    garch <- test_garch_model(spec,model_name,log_return)
+    if(class(garch)!="character"){
+      print("EGARCH as a backup version was used")
+      return(ugarchforecast(garch,n.ahead=forecast_horizon,custom.dist = list(name = "sample",
+                                 distfit = monte_copula_res[,i])))}
+    else{
+      spec <- ugarchspec(variance.model = list(garchOrder=c(1,1)),mean.model = list(armaOrder=c(arma_par[1],arma_par[2])))
+      garch <- test_garch_model(spec,model_name,log_return)
+      print("EGARCH as a backup version was used")
+      return(ugarchforecast(garch,n.ahead=forecast_horizon,custom.dist = list(name = "sample",
+                                 distfit = monte_copula_res[,i])))
+    }
+  }
+  else{
+    return(ugarchforecast(garch,n.ahead=forecast_horizon,custom.dist = list(name = "sample",
+                                 distfit = monte_copula_res[,i])))
+  }
+}
+```
+
+
+Function for finding the best ARMA-GARCH model based on the results of the Andersen Darling test
+```{r}
+determine_best_garch_model <- function(log_return,adtest){
+  matr <- matrix(ncol=6,nrow=ncol(log_return))
+  coln <- colnames(log_return)
+  for(i in 1:length(coln)){
+    adkparam <-filter(adtest,Stock==coln[i])$Itau
+    return_to_analyze <-as.vector(log_return[,i])
+    return_to_analyze <- return_to_analyze[adkparam:length(return_to_analyze)]
+    arima_parametrs <- arimaorder(auto.arima(return_to_analyze))
+    arima_parametrs_to_garch <- c(arima_parametrs[1],arima_parametrs[3])
+    garch_selection <- best_fitted_garch(return_to_analyze,arima_parametrs_to_garch)
+    if(nrow(garch_selection)!=0){
+       print(paste("parametrs estimated succesfully for ",coln[i]))
+       min_bic <- min(garch_selection[,2])
+       for(j in 1:nrow(garch_selection)){
+            if(garch_selection[j,2]==min_bic){
+               model_garch <- rownames(garch_selection)[j]
+               break
+      }
+    }
+       cci <- c(coln[i],adkparam,arima_parametrs[1],arima_parametrs[3],model_garch,min_bic)
+       print(cci)
+       matr[i,] <- cci  
+    }
+    else{
+       cci <- c(coln[i],adkparam,arima_parametrs[1],arima_parametrs[3],"NA",10000)
+       matr[i,] <- cci
+    }
+  }
+  matr <- data.frame(matr)
+  colnames(matr) <- c("Stock","ADKtest","AR_measure","MA_measure","Best_fitted_garch","BIC_for_garch")
+  return(matr)
+}
+```
+
+
+A function for obtaining residuals on the best ARMA-GARCH models for each stock
+```{r}
+rresiduals_for_stocks <- function(log_return,best_models,adtest){
+  k_min <- nrow(log_return)-max(adtest$Itau)
+  matr <- matrix(ncol=nrow(best_models),nrow=k_min)
+  print(dim(matr))
+  print(1)
+  for (i in 1:nrow(best_models)){
+     start_step <- best_models[i,2]
+     log_returns <-log_return[c(start_step:nrow(log_return)),i]
+     
+     model_initial <- as.vector(unlist(strsplit(best_models[i,5],"0")))
+  
+     if(model_initial[1]=="garch"){
+       if(model_initial[2]=="1"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(1,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="2"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(2,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="3"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(0,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="4"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(0,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="5"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(1,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="6"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(2,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="7"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(1,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="8"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(2,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }}
+     if(model_initial[1]=="egarch"){
+       if(model_initial[2]=="1"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="2"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(2,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="3"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(0,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="4"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(0,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="5"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="6"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(2,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="7"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="8"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(2,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }}
+     if(model_initial[1]=="grjgarch"){
+       if(model_initial[2]=="1"){
+           
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(1,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="2"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(2,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="3"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(0,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="4"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(0,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="5"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="6"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(2,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="7"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(1,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="8"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(2,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+       }}
+     if(model_initial[1]=="agarch"){
+       if(model_initial[2]=="1"){
+          
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(1,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="2"){
+          
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(2,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="3"){
+          
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(0,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="4"){
+          
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(0,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="5"){
+          
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="6"){
+          
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(2,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="7"){
+          
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(1,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="8"){
+          
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(2,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+       }}
+     predicts <- trap_for_garch_resid(fits,model_initial,log_returns)
+     predicts <- predicts[(length(predicts)-k_min):length(predicts)]
+     print(length(predicts))
+     matr[,i] <- predicts
+     print(i)
+  }
+  colnames(matr) <- colnames(log_return)
+  matr <- data.frame(matr)
+  return(matr)
+}
+```
+
+
+Finding the best copula function for the residuals of ARMA GARCH models, the best copula model (R-vine or D-vine) is selected using BIC criteria
+The optimal structure of each Copula was found automatically using RVineStructureSelect package
+```{r}
+copula_choice <- function(garch_resids){
+  copu0 <- RVineStructureSelect(garch_resids,selectioncrit = "BIC",level=0.05,type=0)
+  res0 <- c(as.numeric(copu0$BIC),as.numeric(copu0$AIC),as.numeric(copu0$logLik))
+  print(res0)
+  
+  copu1 <- RVineStructureSelect(garch_resids,selectioncrit = "BIC",level=0.05,type=1)
+  res1 <- c(as.numeric(copu1$BIC),as.numeric(copu1$AIC),as.numeric(copu1$logLik))
+  print(res1)
+  if (res0[1]<=res1[1]){
+    copu_best=copu0
+    return(copu0)
+  }
+  else{
+    return(copu1)
+  }
+}
+```
+
+
+Modeling random variables from the calculated distribution (n times), and then searching for the average of n datasets
+```{r}
+forecast_stocks <- function(copula,uniform_resids,resids,time){
+  for (i in 1:time){
+    if (i==1){
+      simulate <- RVineSim(20,copula)
+      matr <- take_forecast_residuals(simulate,uniform_resids,resids)
+    }
+    else{
+      matr <- matr+take_forecast_residuals(simulate,uniform_resids,resids)
+    }
+  }
+  matr <- matr/time
+  return(matr)
+}
+```
+
+
+A function for predicting log returns using selected ARMA-GARCH models for stocks
+```{r}
+forecasts_for_stocks <- function(log_return,best_models,monte_copula_res,forecast_horizon){
+  
+  matr <- matrix(ncol=nrow(best_models),nrow=forecast_horizon)
+  print(dim(matr))
+  for (i in 1:nrow(best_models)){
+     start_step <- best_models[i,2]
+     log_returns <-log_return[c(start_step:nrow(log_return)),i]
+     model_initial <- as.vector(unlist(strsplit(best_models[i,5],"0")))
+  
+     if(model_initial[1]=="garch"){
+       if(model_initial[2]=="1"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(1,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="2"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(2,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="3"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(0,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="4"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(0,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="5"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(1,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="6"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(2,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="7"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(1,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="8"){
+          
+          fits <- ugarchspec(variance.model = list(garchOrder=c(2,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }}
+     if(model_initial[1]=="egarch"){
+       if(model_initial[2]=="1"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="2"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(2,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="3"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(0,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="4"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(0,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="5"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="6"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(2,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="7"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(1,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="8"){
+          
+          fits <- ugarchspec(variance.model = list(model="eGARCH",garchOrder=c(2,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }}
+     if(model_initial[1]=="grjgarch"){
+       if(model_initial[2]=="1"){
+        
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(1,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="2"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(2,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="3"){
+        
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(0,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="4"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(0,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="5"){
+          
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="6"){
+         
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(2,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="7"){
+        
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(1,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="8"){
+        
+          fits <- ugarchspec(variance.model = list(model="gjrGARCH",garchOrder=c(2,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+       }}
+     if(model_initial[1]=="agarch"){
+       if(model_initial[2]=="1"){
+    
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(1,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="2"){
+        
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(2,0)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="3"){
+       
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(0,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="4"){
+     
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(0,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="5"){
+     
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(1,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="6"){
+       
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(2,1)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="7"){
+      
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(1,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+    }
+       else if (model_initial[2]=="8"){
+      
+          fits <- ugarchspec(variance.model = list(model="apARCH",garchOrder=c(2,2)),mean.model = list(armaOrder=c(best_models[i,3],best_models[i,4])))
+       }}
+     predicts=trap_for_garch_forecasts(fits,model_initial,log_returns,forecast_horizon)
+     predicts <- as.vector(fitted(predicts))
+     print(length(predicts))
+     matr[,i] <- predicts
+  }
+  colnames(matr) <- colnames(log_return)
+  return(matr)
+}
+```
+
+
+A function for recalculating stock prices from predicted log returns
+```{r}
+predicted_prices <- function(prices,predicted){
+  matr <- matrix(ncol=ncol(predicted),nrow=nrow(predicted))
+  
+  for (i in 1:ncol(prices)){
+    result <- c(rep(prices[1,i],nrow(predicted)))
+    for (j in 1:nrow(predicted)){
+      if (j==1){
+        result[j] <- result[j]*exp(predicted[j,i])
+      }
+      else{
+        result[j] <- result[j-1]*exp(predicted[j,i])
+      }
+      
+    }
+    
+    matr[,i] <- result
+  }
+  matr <- data.frame(matr)
+  colnames(matr) <- colnames(prices)
+  return(matr)
+}
+```
+
+
+
+Transformation of random variables obtained from Copula into log-returns
+```{r}
+take_forecast_residuals <- function(copula_sim,uniform_resid,resid){
+  matr <- matrix(ncol=ncol(copula_sim),nrow=nrow(copula_sim))
+  for (i in 1:ncol(copula_sim)){
+    rp <- sort(uniform_resid[,i])
+    copi <- copula_sim[,i]
+    result <- c()
+    for (j in 1:length(copi)){
+      for (k in 1:length(rp)){
+        if (copi[j]<rp[k]){
+          if (k!=length(rp)){
+            result <- c(result,rp[k])
+            break}
+          
+          else{
+            result <- c(result,rp[k-1])
+            break
+          }
+        }
+        else if(k==length(rp)){
+          result <- c(result,rp[k-1])
+          break
+        }
+      }
+    }
+    
+    place_uniform=c()
+    unif_res <- uniform_resid[,i]
+    for (l in 1:length(result)){
+      for(h in 1:length(unif_res)){
+        if (result[l]==unif_res[h]){
+          place_uniform <- c(place_uniform,h)
+          break
+        }
+      }
+    }
+    
+    true_res <- c()
+    true_obs_res <- resid[,i]
+    for(q in 1:length(place_uniform)){
+      true_res <- c(true_res,true_obs_res[place_uniform[q]])
+    }
+    
+    matr[,i] <- true_res
+  }
+  
+  colnames(matr) <- colnames(copula_sim)
+  return(matr)
+}
+#take_forecast_resid_by_copula <- take_forecast_residuals(simulation_by_copula,uniform_garch_residuals,residuals_for_stocks)
+```
+
+
+
+The final function that calculates the projected returns for stocks for each time period.
+Warning! The first column must be vector which denotes periods (for example months). 'start_point' and 'end_point' parametrs are refer to needed time interval
+```{r}
+t0=Sys.time()
+portfolio_simulation <- function(data,start_point,end_point){
+  a0=c(1,2,5,10)
+  k=max(unique(to_port$month_count))
+  max_step=k-37
+  weights0 <- c(1,1,1,1)
+  weights1 <- c(1,1,1,1)
+  matr <- matrix(ncol=(1+3*length(a0)),nrow=max_step-1)
+
+  for (i in start_point:end_point){
+    
+    result <- c(i)
+    print(paste(i,max(data$month_count),min(data$month_count)))
+    stocks <- filter(data,month_count>i & month_count<=(36+i))
+    param=1
+    adktest <- andersen_darling_stocks_test(stocks)
+    
+    adktest$Itau <- as.numeric(as.character(adktest$Itau))
+    print(adktest$Itau)
+    print(dim(stocks))
+    for (po in 1:nrow(adktest)){
+      adktest[po,2]=0
+      }
+    print(adktest$Itau)
+    log_to_port <- log_function_for_dataset(stocks)
+    log_to_port <- log_to_port[,-1]
+    param=1
+    print(paste("Searching for the best models",i))
+    
+    best_models_for_stocks <- determine_best_garch_model(log_to_port,adktest)
+    best_models_for_stocks$Best_fitted_garch <- as.character(best_models_for_stocks$Best_fitted_garch)
+    best_models_for_stocks$AR_measure <- as.numeric(as.character(best_models_for_stocks$AR_measure))
+    best_models_for_stocks$MA_measure <- as.numeric(as.character(best_models_for_stocks$MA_measure))
+    best_models_for_stocks$ADKtest <- as.numeric(as.character(best_models_for_stocks$ADKtest))
+    best_models_for_stocks$Stock <- as.character(best_models_for_stocks$Stock)
+    best_models_for_stocks$BIC_for_garch <- as.numeric(as.character(best_models_for_stocks$BIC_for_garch))
+    print(paste("Models evaluated for ",i))
+    residuals_for_stocks <- rresiduals_for_stocks(log_to_port,best_models_for_stocks,adktest)
+    uniform_garch_residuals <- uniform_data(residuals_for_stocks)
+    copu_best <- copula_choice(uniform_garch_residuals)
+    monte_copula_forecast <- forecast_stocks(copu_best,uniform_garch_residuals,residuals_for_stocks,5000)
+    predictions_for_stocks <- forecasts_for_stocks(log_to_port,best_models_for_stocks,monte_copula_forecast,20)
+    final_predictions <- predictions_for_stocks
+    final_predictions <- data.frame(final_predictions)
+    last_stocks <- stocks[nrow(stocks),]
+    last_stocks <- last_stocks[,-1]
+    predicted_prices_for_stocks <- predicted_prices(last_stocks,final_predictions)
+    stocks_real_future_prices <- filter(to_port,month_count==(i+37))[,-1]
+
+    prices <- c()
+    for (l in 1:ncol(predicted_prices_for_stocks)){
+        prices <- c(prices,predicted_prices_for_stocks[nrow(predicted_prices_for_stocks),l]/predicted_prices_for_stocks[1,l])}
+    print(prices)
+    
+    t1=Sys.time()
+    print(t1-t0)
+  }
+  return(matr)
+}
+```
+
+
+
+
